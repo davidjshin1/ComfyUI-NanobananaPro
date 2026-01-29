@@ -9,7 +9,8 @@ import io
 class NanoBananaProNode:
     """
     ComfyUI Node for Nano Banana Pro (Gemini 3 Pro Image Preview)
-    Designed to be a drop-in replacement for GeminiImage2Node but with custom API Key support.
+    Drop-in replacement for GeminiImage2Node with direct API support.
+    Accepts client connection from GeminiAPIConfig node.
     """
     
     def __init__(self):
@@ -19,13 +20,12 @@ class NanoBananaProNode:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "api_key": ("STRING", {"multiline": False, "default": "", "placeholder": "Enter your Gemini API Key"}),
-                "prompt": ("STRING", {"multiline": True, "default": "Describe the image you want to generate..."}),
-                "images": ("IMAGE",),  # Accepts a batch of images (tensor)
+                "prompt": ("STRING", {"multiline": True, "default": "Describe the image you want to generate...", "forceInput": True}),
+                "images": ("IMAGE",),
+                "client": ("GEMINI_CLIENT",),  # Connection from GeminiAPIConfig
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "aspect_ratio": (["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"], {"default": "3:4"}),
                 "resolution": (["1K", "2K", "4K"], {"default": "4K"}),
-                "response_modalities": (["IMAGE", "TEXT", "IMAGE,TEXT"], {"default": "IMAGE"}),
             }
         }
 
@@ -34,8 +34,7 @@ class NanoBananaProNode:
     FUNCTION = "generate_image"
     CATEGORY = "NanoBanana 🍌"
 
-    # Add version to ensure refresh
-    VERSION = "1.1.0"
+    VERSION = "1.2.0"
 
     def tensor_to_base64(self, image_tensor):
         # Convert single tensor image to base64
@@ -47,9 +46,33 @@ class NanoBananaProNode:
         img.save(buffered, format="PNG")
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    def generate_image(self, api_key, prompt, images, seed, aspect_ratio, resolution, response_modalities):
+    def extract_api_key(self, client):
+        """Extract API key from various client object types."""
+        # If it's already a string, use it directly
+        if isinstance(client, str):
+            return client
+        
+        # If it has an api_key attribute (common pattern)
+        if hasattr(client, 'api_key'):
+            return client.api_key
+        
+        # If it's a dict-like object
+        if hasattr(client, 'get'):
+            return client.get('api_key', None)
+        
+        # If it's a tuple (sometimes ComfyUI passes tuples)
+        if isinstance(client, tuple) and len(client) > 0:
+            return self.extract_api_key(client[0])
+        
+        # Last resort - try to convert to string
+        return str(client)
+
+    def generate_image(self, prompt, images, client, seed, aspect_ratio, resolution):
+        # Extract API key from client object
+        api_key = self.extract_api_key(client)
+        
         if not api_key:
-            raise ValueError("API Key is required for Nano Banana Pro.")
+            raise ValueError("Could not extract API Key from client connection.")
 
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image-preview:generateContent"
         
@@ -79,18 +102,13 @@ class NanoBananaProNode:
                 "parts": parts
             }],
             "generationConfig": {
-                "responseModalities": ["TEXT", "IMAGE"], # Always request both to catch text errors/thoughts
+                "responseModalities": ["TEXT", "IMAGE"],
                 "imageConfig": {
                     "aspectRatio": aspect_ratio,
                     "imageSize": resolution
                 }
             }
         }
-
-        # Add seed if it's not 0 (optional based on API support, but good practice)
-        # Note: Gemini API seed support varies, but we pass it if needed or handle logic here.
-        # Currently, Gemini 3 API might not strictly respect an integer seed in the payload
-        # the same way Stable Diffusion does, but we keep the input for compatibility.
 
         headers = {
             "x-goog-api-key": api_key,
@@ -99,7 +117,7 @@ class NanoBananaProNode:
 
         # Make the API request
         try:
-            response = requests.post(url, headers=headers, json=payload)
+            response = requests.post(url, headers=headers, json=payload, timeout=120)
             response.raise_for_status()
             result = response.json()
             
@@ -109,7 +127,6 @@ class NanoBananaProNode:
 
             candidates = result.get('candidates', [])
             if not candidates:
-                # If safety filters blocked it, the candidate list might be empty or contain finishReason
                 raise ValueError(f"No candidates returned. Response: {json.dumps(result)}")
 
             for part in candidates[0].get('content', {}).get('parts', []):
@@ -129,16 +146,13 @@ class NanoBananaProNode:
 
             if not generated_images:
                 print(f"Warning: No image returned. Text: {final_text}")
-                # Return blank image if failed
                 blank = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
                 return (blank, final_text)
 
-            # Concatenate images if multiple returned
             final_image_batch = torch.cat(generated_images, dim=0)
             
             return (final_image_batch, final_text)
 
         except Exception as e:
             print(f"Error calling Nano Banana API: {e}")
-            # Raise to show in ComfyUI
             raise RuntimeError(f"API Error: {e}")
