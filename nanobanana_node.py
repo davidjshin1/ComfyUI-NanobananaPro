@@ -9,7 +9,7 @@ import io
 class NanoBananaProNode:
     """
     ComfyUI Node for Nano Banana Pro (Gemini 3 Pro Image Preview)
-    Based on Google GenAI API documentation.
+    Designed to be a drop-in replacement for GeminiImage2Node but with custom API Key support.
     """
     
     def __init__(self):
@@ -20,14 +20,12 @@ class NanoBananaProNode:
         return {
             "required": {
                 "api_key": ("STRING", {"multiline": False, "default": "", "placeholder": "Enter your Gemini API Key"}),
-                "prompt": ("STRING", {"multiline": True, "default": "A photorealistic shot of..."}),
-                "aspect_ratio": (["1:1", "16:9", "9:16", "4:3", "3:4"], {"default": "1:1"}),
-                "resolution": (["1K", "2K", "4K"], {"default": "2K"}),
-                "image_input_1": ("IMAGE", {"default": None}), # Optional input image
-            },
-            "optional": {
-                "image_input_2": ("IMAGE", {"default": None}),
-                "image_input_3": ("IMAGE", {"default": None}),
+                "prompt": ("STRING", {"multiline": True, "default": "Describe the image you want to generate..."}),
+                "images": ("IMAGE",),  # Accepts a batch of images (tensor)
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "aspect_ratio": (["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"], {"default": "3:4"}),
+                "resolution": (["1K", "2K", "4K"], {"default": "4K"}),
+                "response_modalities": (["IMAGE", "TEXT", "IMAGE,TEXT"], {"default": "IMAGE"}),
             }
         }
 
@@ -37,23 +35,16 @@ class NanoBananaProNode:
     CATEGORY = "NanoBanana 🍌"
 
     def tensor_to_base64(self, image_tensor):
-        if image_tensor is None:
-            return None
-            
-        # Handle batch dimension if present (take first image)
-        if len(image_tensor.shape) > 3:
-            image_tensor = image_tensor[0]
-            
-        # Convert tensor to PIL Image
+        # Convert single tensor image to base64
+        # Input tensor shape: [H, W, C]
         i = 255. * image_tensor.cpu().numpy()
         img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
         
-        # Convert to base64
         buffered = io.BytesIO()
         img.save(buffered, format="PNG")
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    def generate_image(self, api_key, prompt, aspect_ratio, resolution, image_input_1=None, image_input_2=None, image_input_3=None):
+    def generate_image(self, api_key, prompt, images, seed, aspect_ratio, resolution, response_modalities):
         if not api_key:
             raise ValueError("API Key is required for Nano Banana Pro.")
 
@@ -62,10 +53,16 @@ class NanoBananaProNode:
         # Prepare content parts
         parts = [{"text": prompt}]
         
-        # Add input images if provided
-        for img in [image_input_1, image_input_2, image_input_3]:
-            if img is not None:
-                b64_data = self.tensor_to_base64(img)
+        # Process input images (handle batch)
+        # images shape is [B, H, W, C]
+        if images is not None:
+            batch_size = images.shape[0]
+            # Limit to max 14 images as per Gemini 3 specs
+            limit = min(batch_size, 14)
+            
+            for i in range(limit):
+                single_image = images[i]
+                b64_data = self.tensor_to_base64(single_image)
                 if b64_data:
                     parts.append({
                         "inline_data": {
@@ -79,13 +76,18 @@ class NanoBananaProNode:
                 "parts": parts
             }],
             "generationConfig": {
-                "responseModalities": ["TEXT", "IMAGE"],
+                "responseModalities": ["TEXT", "IMAGE"], # Always request both to catch text errors/thoughts
                 "imageConfig": {
                     "aspectRatio": aspect_ratio,
                     "imageSize": resolution
                 }
             }
         }
+
+        # Add seed if it's not 0 (optional based on API support, but good practice)
+        # Note: Gemini API seed support varies, but we pass it if needed or handle logic here.
+        # Currently, Gemini 3 API might not strictly respect an integer seed in the payload
+        # the same way Stable Diffusion does, but we keep the input for compatibility.
 
         headers = {
             "x-goog-api-key": api_key,
@@ -104,7 +106,8 @@ class NanoBananaProNode:
 
             candidates = result.get('candidates', [])
             if not candidates:
-                raise ValueError("No candidates returned from API.")
+                # If safety filters blocked it, the candidate list might be empty or contain finishReason
+                raise ValueError(f"No candidates returned. Response: {json.dumps(result)}")
 
             for part in candidates[0].get('content', {}).get('parts', []):
                 if 'text' in part:
@@ -119,18 +122,20 @@ class NanoBananaProNode:
                     img_tensor = torch.from_numpy(img_np)[None,]
                     generated_images.append(img_tensor)
             
-            if not generated_images:
-                # If no image generated, return a blank black image
-                print("Warning: No image returned, returning blank.")
-                blank = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
-                return (blank, "\n".join(response_texts))
-
-            # Concatenate images if multiple returned (batch)
-            final_image_batch = torch.cat(generated_images, dim=0)
             final_text = "\n".join(response_texts)
+
+            if not generated_images:
+                print(f"Warning: No image returned. Text: {final_text}")
+                # Return blank image if failed
+                blank = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+                return (blank, final_text)
+
+            # Concatenate images if multiple returned
+            final_image_batch = torch.cat(generated_images, dim=0)
             
             return (final_image_batch, final_text)
 
         except Exception as e:
             print(f"Error calling Nano Banana API: {e}")
-            raise e
+            # Raise to show in ComfyUI
+            raise RuntimeError(f"API Error: {e}")
