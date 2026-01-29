@@ -34,6 +34,9 @@ class NanoBananaProNode:
     FUNCTION = "generate_image"
     CATEGORY = "NanoBanana 🍌"
 
+    # Add version to ensure refresh
+    VERSION = "1.1.0"
+
     def tensor_to_base64(self, image_tensor):
         # Convert single tensor image to base64
         # Input tensor shape: [H, W, C]
